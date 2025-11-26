@@ -9,7 +9,7 @@
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -319,7 +319,10 @@ def main():
     # ===============================================================
     # === TIMESTAMP EM K2 DA ABA ATIVIDADES_POR_PONTO_BASE ==========
     # ===============================================================
-    timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    # Usa UTC-3 para bater com horário de Brasília (sem depender do fuso do servidor)
+    now_brt = datetime.utcnow() - timedelta(hours=3)
+    timestamp = now_brt.strftime("%d/%m/%Y %H:%M:%S")
+
     try:
         svc.spreadsheets().values().update(
             spreadsheetId=DEST_SPREADSHEET_ID,
@@ -327,7 +330,7 @@ def main():
             valueInputOption="USER_ENTERED",
             body={"values": [[timestamp]]}
         ).execute()
-        print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!K2: {timestamp}")
+        print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!K2 (BRT): {timestamp}")
     except Exception as e:
         print("⚠️ Erro ao gravar timestamp em K2:", e)
 

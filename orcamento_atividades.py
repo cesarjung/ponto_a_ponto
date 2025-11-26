@@ -9,6 +9,7 @@
 
 import os
 import re
+from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -314,6 +315,21 @@ def main():
     print("\n=== RELATÓRIO DE IMPORTAÇÃO ===")
     print("\n".join(report_lines))
     print("\n✅ OK - Tudo conferido!" if ok else "\n⚠️ Diferença detectada.")
+
+    # ===============================================================
+    # === TIMESTAMP EM K2 DA ABA ATIVIDADES_POR_PONTO_BASE ==========
+    # ===============================================================
+    timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=DEST_SPREADSHEET_ID,
+            range=f"{DEST_SHEET_NAME}!K2",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[timestamp]]}
+        ).execute()
+        print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!K2: {timestamp}")
+    except Exception as e:
+        print("⚠️ Erro ao gravar timestamp em K2:", e)
 
 
 if __name__ == "__main__":

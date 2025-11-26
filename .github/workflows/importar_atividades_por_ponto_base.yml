@@ -1,0 +1,36 @@
+name: Importar ATIVIDADES_POR_PONTO_BASE
+
+on:
+  schedule:
+    # Horário do GitHub Actions é UTC
+    # 07:00 BRT -> 10:00 UTC
+    # 12:00 BRT -> 15:00 UTC
+    # 15:00 BRT -> 18:00 UTC
+    # 18:00 BRT -> 21:00 UTC
+    - cron: "0 10,15,18,21 * * *"
+  workflow_dispatch:  # permite rodar manualmente
+
+jobs:
+  importar-atividades:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+
+      - name: Criar credenciais.json
+        run: |
+          echo "${{ secrets.GOOGLE_CREDENTIALS }}" > credenciais.json
+
+      - name: Executar importador
+        run: |
+          python importar_atividades_por_ponto_base.py

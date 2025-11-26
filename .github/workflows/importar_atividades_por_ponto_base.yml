@@ -33,4 +33,4 @@ jobs:
 
       - name: Executar importador
         run: |
-          python importar_atividades_por_ponto_base.py
+          python orcamento_atividades.py

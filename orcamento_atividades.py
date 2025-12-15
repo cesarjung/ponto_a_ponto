@@ -197,9 +197,12 @@ def read_source_block(svc, spreadsheet_id, sheet_name):
     return tratar_colunas_numericas(rows)
 
 
-def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row, num_cols):
-    col_end = chr(ord("A") + num_cols - 1)
-    rng = f"{sheet_name}!A{start_row}:{col_end}"
+# ===============================================================
+# LIMPAR DESTINO (A2:K)
+# ===============================================================
+def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row):
+    # limpa de A2 até K (incluindo coluna K)
+    rng = f"{sheet_name}!A{start_row}:K"
     svc.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id,
         range=rng,
@@ -310,13 +313,12 @@ def main():
     )
 
     # Limpa destino e cola
-    print("🧹 Limpando destino A2:J...")
+    print("🧹 Limpando destino A2:K...")
     clear_dest_range(
         svc,
         DEST_SPREADSHEET_ID,
         DEST_SHEET_NAME,
         START_ROW_DEST,
-        NUM_COLS,
     )
 
     print(f"📤 Colando {total_expected} linha(s) em {DEST_SHEET_NAME}...")

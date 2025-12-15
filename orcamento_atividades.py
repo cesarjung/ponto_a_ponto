@@ -68,7 +68,7 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
             break
 
     if not target_sheet:
-        # Já garantimos antes que a aba existe, mas por segurança:
+        # já deveria existir, mas por segurança
         return
 
     sheet_id = target_sheet["sheetId"]
@@ -88,27 +88,25 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
         fields_list.append("gridProperties.columnCount")
 
     if not new_grid:
-        # Nada para alterar
         return
 
     fields_str = ",".join(fields_list)
-
     body = {
         "requests": [
             {
                 "updateSheetProperties": {
                     "properties": {
                         "sheetId": sheet_id,
-                        "gridProperties": new_grid
+                        "gridProperties": new_grid,
                     },
-                    "fields": fields_str
+                    "fields": fields_str,
                 }
             }
         ]
     }
     svc.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
-        body=body
+        body=body,
     ).execute()
 
 
@@ -149,7 +147,7 @@ def read_values(svc, spreadsheet_id, rng):
     resp = svc.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=rng,
-        majorDimension="ROWS"
+        majorDimension="ROWS",
     ).execute()
     return resp.get("values", [])
 
@@ -164,7 +162,7 @@ def extract_spreadsheet_id(text):
     if m:
         return m.group(1)
     # ID 'cru': letras, números, - e _
-    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", text):  # IDs costumam ser longos
+    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", text):
         return text
     return None
 
@@ -180,6 +178,7 @@ def get_source_ids_from_config(svc):
         sid = extract_spreadsheet_id(cell)
         if sid:
             ids.append(sid)
+
     # remove duplicatas mantendo ordem
     seen = set()
     uniq = []
@@ -204,31 +203,41 @@ def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row, num_cols):
     svc.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id,
         range=rng,
-        body={}
+        body={},
     ).execute()
 
 
-def write_values_in_chunks(svc, spreadsheet_id, sheet_name, start_row, data, chunk_rows, num_cols):
+def write_values_in_chunks(
+    svc,
+    spreadsheet_id,
+    sheet_name,
+    start_row,
+    data,
+    chunk_rows,
+    num_cols,
+):
     total = len(data)
     written = 0
-    col_end = chr(ord('A') + num_cols - 1)
+    col_end = chr(ord("A") + num_cols - 1)
     while written < total:
         take = min(chunk_rows, total - written)
-        chunk = data[written:written + take]
+        chunk = data[written : written + take]
         start = start_row + written
         end = start + take - 1
         rng = f"{sheet_name}!A{start}:{col_end}{end}"
         svc.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=rng,
-            valueInputOption="USER_ENTERED",  # garante números como números
-            body={"values": chunk}
+            valueInputOption="USER_ENTERED",
+            body={"values": chunk},
         ).execute()
         written += take
     return written
 
 
-def count_nonempty_rows_in_col_a(svc, spreadsheet_id, sheet_name, start_row, expected_rows):
+def count_nonempty_rows_in_col_a(
+    svc, spreadsheet_id, sheet_name, start_row, expected_rows
+):
     end_row = start_row + max(expected_rows - 1, 0)
     if end_row < start_row:
         return 0
@@ -290,18 +299,35 @@ def main():
         print("\nNada para colar.")
         return
 
-    # Garante que a grade da aba tenha linhas/colunas suficientes
+    # Garante que a grade da aba tenha linhas/colunas suficientes (A:J)
     min_rows = START_ROW_DEST + total_expected - 1
-    ensure_dest_grid_size(svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME, min_rows, NUM_COLS)
+    ensure_dest_grid_size(
+        svc,
+        DEST_SPREADSHEET_ID,
+        DEST_SHEET_NAME,
+        min_rows,
+        NUM_COLS,
+    )
 
     # Limpa destino e cola
     print("🧹 Limpando destino A2:J...")
-    clear_dest_range(svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME, START_ROW_DEST, NUM_COLS)
+    clear_dest_range(
+        svc,
+        DEST_SPREADSHEET_ID,
+        DEST_SHEET_NAME,
+        START_ROW_DEST,
+        NUM_COLS,
+    )
 
     print(f"📤 Colando {total_expected} linha(s) em {DEST_SHEET_NAME}...")
     write_values_in_chunks(
-        svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME,
-        START_ROW_DEST, all_rows, WRITE_CHUNK_ROWS, NUM_COLS
+        svc,
+        DEST_SPREADSHEET_ID,
+        DEST_SHEET_NAME,
+        START_ROW_DEST,
+        all_rows,
+        WRITE_CHUNK_ROWS,
+        NUM_COLS,
     )
 
     # Checagem final
@@ -309,30 +335,88 @@ def main():
         svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME, START_ROW_DEST, total_expected
     )
 
-    report_lines.append(f"Total efetivamente colado (coluna A): {pasted_count} linha(s).")
-    ok = (pasted_count == total_expected)
+    report_lines.append(
+        f"Total efetivamente colado (coluna A): {pasted_count} linha(s)."
+    )
+    ok = pasted_count == total_expected
 
     print("\n=== RELATÓRIO DE IMPORTAÇÃO ===")
     print("\n".join(report_lines))
     print("\n✅ OK - Tudo conferido!" if ok else "\n⚠️ Diferença detectada.")
 
     # ===============================================================
-    # === TIMESTAMP EM K2 DA ABA ATIVIDADES_POR_PONTO_BASE ==========
+    # === COLUNA K: GERAR CÓDIGO A PARTIR DA COLUNA B ===============
     # ===============================================================
-    # Usa UTC-3 para bater com horário de Brasília (sem depender do fuso do servidor)
+    try:
+        if pasted_count > 0:
+            start_row = START_ROW_DEST
+            end_row = START_ROW_DEST + pasted_count - 1
+
+            # garante até a coluna K
+            ensure_dest_grid_size(
+                svc,
+                DEST_SPREADSHEET_ID,
+                DEST_SHEET_NAME,
+                min_rows=end_row,
+                min_cols=11,
+            )
+
+            rng_b = f"{DEST_SHEET_NAME}!B{start_row}:B{end_row}"
+            vals_b = read_values(svc, DEST_SPREADSHEET_ID, rng_b)
+
+            new_k_values = []
+            for i in range(pasted_count):
+                val_b = ""
+                if i < len(vals_b) and vals_b[i]:
+                    val_b = vals_b[i][0]
+
+                if val_b in ("", None):
+                    new_k_values.append([""])
+                    continue
+
+                if not isinstance(val_b, str):
+                    val_b = str(val_b)
+
+                before_underscore = val_b.split("_", 1)[0]
+                digits_only = re.sub(r"\D", "", before_underscore)
+
+                if len(digits_only) == 6:
+                    prefix = "B-0"
+                elif len(digits_only) == 7:
+                    prefix = "B-"
+                else:
+                    prefix = "B-"  # fallback
+
+                k_val = prefix + val_b
+                new_k_values.append([k_val])
+
+            rng_k = f"{DEST_SHEET_NAME}!K{start_row}:K{end_row}"
+            svc.spreadsheets().values().update(
+                spreadsheetId=DEST_SPREADSHEET_ID,
+                range=rng_k,
+                valueInputOption="USER_ENTERED",
+                body={"values": new_k_values},
+            ).execute()
+            print(f"🔤 Coluna K preenchida para {pasted_count} linha(s).")
+    except Exception as e:
+        print("⚠️ Erro ao atualizar coluna K:", e)
+
+    # ===============================================================
+    # === TIMESTAMP EM L2 DA ABA ATIVIDADES_POR_PONTO_BASE ==========
+    # ===============================================================
     now_brt = datetime.utcnow() - timedelta(hours=3)
     timestamp = now_brt.strftime("%d/%m/%Y %H:%M:%S")
 
     try:
         svc.spreadsheets().values().update(
             spreadsheetId=DEST_SPREADSHEET_ID,
-            range=f"{DEST_SHEET_NAME}!K2",
+            range=f"{DEST_SHEET_NAME}!L2",
             valueInputOption="USER_ENTERED",
-            body={"values": [[timestamp]]}
+            body={"values": [[timestamp]]},
         ).execute()
-        print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!K2 (BRT): {timestamp}")
+        print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!L2 (BRT): {timestamp}")
     except Exception as e:
-        print("⚠️ Erro ao gravar timestamp em K2:", e)
+        print("⚠️ Erro ao gravar timestamp em L2:", e)
 
 
 if __name__ == "__main__":

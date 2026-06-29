@@ -10,18 +10,25 @@ on:
     - cron: "0 10,15,18,21 * * *"
   workflow_dispatch:
 
+# Evita duas execuções gravando no mesmo destino ao mesmo tempo
+# (agendada + manual sobrepostas corromperiam o paste). Enfileira, não cancela.
+concurrency:
+  group: orcamento-atividades
+  cancel-in-progress: false
+
 jobs:
   orcamento-atividades:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repositório
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configurar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Instalar dependências
         run: |

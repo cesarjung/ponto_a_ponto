@@ -12,7 +12,7 @@ import re
 import time
 import random
 import socket
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -162,6 +162,15 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
     )
 
 
+def col_index_to_letter(n):
+    """1 -> A, 26 -> Z, 27 -> AA ... (suporta além de 26 colunas)."""
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(ord("A") + rem) + letters
+    return letters
+
+
 def pad_row_to_n_cols(row, n):
     if len(row) < n:
         return row + [""] * (n - len(row))
@@ -255,9 +264,22 @@ def read_source_block(svc, spreadsheet_id, sheet_name):
 # ===============================================================
 # LIMPAR DESTINO (A2:K)
 # ===============================================================
-def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row):
-    # limpa de A2 até K (incluindo coluna K)
-    rng = f"{sheet_name}!A{start_row}:K"
+def get_sheet_row_count(svc, spreadsheet_id, sheet_name):
+    meta = execute_with_retry(
+        svc.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        "ler row count",
+    )
+    for s in meta.get("sheets", []):
+        props = s.get("properties", {})
+        if props.get("title") == sheet_name:
+            return props.get("gridProperties", {}).get("rowCount", 0)
+    return 0
+
+
+def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row, end_row=None):
+    # limpa de A{start_row} até K. Com end_row, delimita (evita estourar a grade).
+    end = end_row if end_row is not None else ""
+    rng = f"{sheet_name}!A{start_row}:K{end}"
     execute_with_retry(
         svc.spreadsheets().values().clear(
             spreadsheetId=spreadsheet_id,
@@ -279,7 +301,7 @@ def write_values_in_chunks(
 ):
     total = len(data)
     written = 0
-    col_end = chr(ord("A") + num_cols - 1)
+    col_end = col_index_to_letter(num_cols)
     while written < total:
         take = min(chunk_rows, total - written)
         chunk = data[written : written + take]
@@ -299,15 +321,20 @@ def write_values_in_chunks(
     return written
 
 
-def count_nonempty_rows_in_col_a(
-    svc, spreadsheet_id, sheet_name, start_row, expected_rows
-):
+def count_pasted_rows(svc, spreadsheet_id, sheet_name, start_row, expected_rows):
+    """Conta linhas coladas olhando colunas A:B.
+    Uma linha conta se A OU B tiver conteúdo. Col A pode virar "" pela
+    limpeza numérica; col B (chave) não sofre limpeza — usar as duas evita
+    o falso 'undercount' que aparecia ao contar só a coluna A.
+    """
     end_row = start_row + max(expected_rows - 1, 0)
     if end_row < start_row:
         return 0
-    rng = f"{sheet_name}!A{start_row}:A{end_row}"
+    rng = f"{sheet_name}!A{start_row}:B{end_row}"
     vals = read_values(svc, spreadsheet_id, rng)
-    return sum(1 for r in vals if len(r) > 0 and r[0] not in ("", None))
+    return sum(
+        1 for r in vals if any(c not in ("", None) for c in r[:2])
+    )
 
 
 def main():
@@ -373,15 +400,9 @@ def main():
         NUM_COLS,
     )
 
-    # Limpa destino e cola
-    print("🧹 Limpando destino A2:K...")
-    clear_dest_range(
-        svc,
-        DEST_SPREADSHEET_ID,
-        DEST_SHEET_NAME,
-        START_ROW_DEST,
-    )
-
+    # Grava ANTES de limpar: o destino nunca fica vazio.
+    # Se a gravação cair no meio, sobra mistura de dado novo + antigo
+    # (sem buraco em branco). Só depois removemos o resíduo abaixo.
     print(f"📤 Colando {total_expected} linha(s) em {DEST_SHEET_NAME}...")
     write_values_in_chunks(
         svc,
@@ -393,13 +414,30 @@ def main():
         NUM_COLS,
     )
 
+    # Limpa só as linhas antigas que sobraram abaixo do novo dado.
+    first_residual = START_ROW_DEST + total_expected
+    row_count = get_sheet_row_count(svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME)
+    if row_count >= first_residual:
+        print(
+            f"🧹 Limpando resíduo (linhas {first_residual}–{row_count}, A:K)..."
+        )
+        clear_dest_range(
+            svc,
+            DEST_SPREADSHEET_ID,
+            DEST_SHEET_NAME,
+            first_residual,
+            row_count,
+        )
+    else:
+        print("🧹 Sem resíduo abaixo do novo dado.")
+
     # Checagem final
-    pasted_count = count_nonempty_rows_in_col_a(
+    pasted_count = count_pasted_rows(
         svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME, START_ROW_DEST, total_expected
     )
 
     report_lines.append(
-        f"Total efetivamente colado (coluna A): {pasted_count} linha(s)."
+        f"Total efetivamente colado (A/B): {pasted_count} linha(s)."
     )
     ok = pasted_count == total_expected
 
@@ -470,7 +508,7 @@ def main():
     # ===============================================================
     # === TIMESTAMP EM L2 DA ABA ATIVIDADES_POR_PONTO_BASE ==========
     # ===============================================================
-    now_brt = datetime.utcnow() - timedelta(hours=3)
+    now_brt = datetime.now(timezone.utc) - timedelta(hours=3)
     timestamp = now_brt.strftime("%d/%m/%Y %H:%M:%S")
 
     try:

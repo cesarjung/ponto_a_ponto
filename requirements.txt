@@ -1,11 +1,6 @@
-google-api-python-client
-google-auth
+# Dependências usadas por orcamento_atividades.py
+# google-api-python-client puxa httplib2; <0.21 evita DecodeRatioError
+# (zip-bomb guard) em respostas grandes do Sheets API.
+google-api-python-client>=2.0,<3
+google-auth>=2.0,<3
 httplib2<0.21
-gspread
-gspread-formatting
-gspread-dataframe
-oauth2client
-pandas
-openpyxl
-requests
-python-dateutil

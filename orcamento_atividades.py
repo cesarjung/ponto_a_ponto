@@ -9,6 +9,9 @@
 
 import os
 import re
+import time
+import random
+import socket
 from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -32,7 +35,47 @@ START_ROW_DEST       = 2   # começa a colar na linha 2
 NUM_COLS             = 10  # A:J
 WRITE_CHUNK_ROWS     = 20000
 
+# Status HTTP transientes que valem retry (rate-limit / erros de servidor)
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = 6
+BASE_DELAY = 2.0  # segundos; cresce exponencial
+
 # ===============================================================
+
+
+def execute_with_retry(request, what="operação"):
+    """Executa request.execute() com backoff exponencial + jitter.
+    Retenta em erros HTTP transientes (429/5xx) e falhas de rede.
+    Re-lança o erro se esgotar as tentativas ou se for erro não-transiente.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                status = None
+            if status in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                delay = BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                print(
+                    f"⏳ {what}: HTTP {status}, retry {attempt}/{MAX_RETRIES} "
+                    f"em {delay:.1f}s..."
+                )
+                time.sleep(delay)
+                continue
+            raise
+        except (socket.timeout, ConnectionError, TimeoutError, OSError) as e:
+            if attempt < MAX_RETRIES:
+                delay = BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                print(
+                    f"⏳ {what}: rede ({type(e).__name__}), retry "
+                    f"{attempt}/{MAX_RETRIES} em {delay:.1f}s..."
+                )
+                time.sleep(delay)
+                continue
+            raise
 
 
 def get_service_and_email():
@@ -46,12 +89,18 @@ def get_service_and_email():
 
 
 def ensure_dest_sheet_exists(svc, spreadsheet_id, sheet_name):
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = execute_with_retry(
+        svc.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        "ler metadados do destino",
+    )
     for s in meta.get("sheets", []):
         if s.get("properties", {}).get("title") == sheet_name:
             return
     body = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
-    svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+    execute_with_retry(
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body),
+        "criar aba de destino",
+    )
 
 
 def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
@@ -59,7 +108,10 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
     Garante que a aba de destino tenha pelo menos min_rows linhas e min_cols colunas.
     Se necessário, atualiza gridProperties.rowCount / columnCount via batchUpdate.
     """
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = execute_with_retry(
+        svc.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        "ler metadados (grid size)",
+    )
     target_sheet = None
     for s in meta.get("sheets", []):
         props = s.get("properties", {})
@@ -104,10 +156,10 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
             }
         ]
     }
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body=body,
-    ).execute()
+    execute_with_retry(
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body),
+        "ajustar tamanho da grade",
+    )
 
 
 def pad_row_to_n_cols(row, n):
@@ -144,11 +196,14 @@ def tratar_colunas_numericas(rows):
 
 
 def read_values(svc, spreadsheet_id, rng):
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=rng,
-        majorDimension="ROWS",
-    ).execute()
+    resp = execute_with_retry(
+        svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=rng,
+            majorDimension="ROWS",
+        ),
+        f"ler {rng}",
+    )
     return resp.get("values", [])
 
 
@@ -203,11 +258,14 @@ def read_source_block(svc, spreadsheet_id, sheet_name):
 def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row):
     # limpa de A2 até K (incluindo coluna K)
     rng = f"{sheet_name}!A{start_row}:K"
-    svc.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=rng,
-        body={},
-    ).execute()
+    execute_with_retry(
+        svc.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=rng,
+            body={},
+        ),
+        f"limpar {rng}",
+    )
 
 
 def write_values_in_chunks(
@@ -228,12 +286,15 @@ def write_values_in_chunks(
         start = start_row + written
         end = start + take - 1
         rng = f"{sheet_name}!A{start}:{col_end}{end}"
-        svc.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=rng,
-            valueInputOption="USER_ENTERED",
-            body={"values": chunk},
-        ).execute()
+        execute_with_retry(
+            svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=rng,
+                valueInputOption="USER_ENTERED",
+                body={"values": chunk},
+            ),
+            f"gravar {rng}",
+        )
         written += take
     return written
 
@@ -393,12 +454,15 @@ def main():
                 new_k_values.append([k_val])
 
             rng_k = f"{DEST_SHEET_NAME}!K{start_row}:K{end_row}"
-            svc.spreadsheets().values().update(
-                spreadsheetId=DEST_SPREADSHEET_ID,
-                range=rng_k,
-                valueInputOption="USER_ENTERED",
-                body={"values": new_k_values},
-            ).execute()
+            execute_with_retry(
+                svc.spreadsheets().values().update(
+                    spreadsheetId=DEST_SPREADSHEET_ID,
+                    range=rng_k,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": new_k_values},
+                ),
+                "gravar coluna K",
+            )
             print(f"🔤 Coluna K preenchida para {pasted_count} linha(s).")
     except Exception as e:
         print("⚠️ Erro ao atualizar coluna K:", e)
@@ -410,12 +474,15 @@ def main():
     timestamp = now_brt.strftime("%d/%m/%Y %H:%M:%S")
 
     try:
-        svc.spreadsheets().values().update(
-            spreadsheetId=DEST_SPREADSHEET_ID,
-            range=f"{DEST_SHEET_NAME}!L2",
-            valueInputOption="USER_ENTERED",
-            body={"values": [[timestamp]]},
-        ).execute()
+        execute_with_retry(
+            svc.spreadsheets().values().update(
+                spreadsheetId=DEST_SPREADSHEET_ID,
+                range=f"{DEST_SHEET_NAME}!L2",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[timestamp]]},
+            ),
+            "gravar timestamp L2",
+        )
         print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!L2 (BRT): {timestamp}")
     except Exception as e:
         print("⚠️ Erro ao gravar timestamp em L2:", e)

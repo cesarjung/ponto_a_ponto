@@ -101,14 +101,25 @@ def get_service_and_email():
     return svc, creds.service_account_email
 
 
-def ensure_dest_sheet_exists(svc, spreadsheet_id, sheet_name):
+def get_sheet_props(svc, spreadsheet_id, sheet_name):
+    """Propriedades (sheetId, gridProperties) da aba, ou None se não existir.
+    Pede só sheets.properties: sem o filtro a API devolve a planilha inteira."""
     meta = execute_with_retry(
-        svc.spreadsheets().get(spreadsheetId=spreadsheet_id),
-        "ler metadados do destino",
+        svc.spreadsheets().get(
+            spreadsheetId=spreadsheet_id, fields="sheets.properties"
+        ),
+        f"ler metadados de {sheet_name}",
     )
     for s in meta.get("sheets", []):
-        if s.get("properties", {}).get("title") == sheet_name:
-            return
+        props = s.get("properties", {})
+        if props.get("title") == sheet_name:
+            return props
+    return None
+
+
+def ensure_dest_sheet_exists(svc, spreadsheet_id, sheet_name):
+    if get_sheet_props(svc, spreadsheet_id, sheet_name):
+        return
     body = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
     execute_with_retry(
         svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body),
@@ -120,21 +131,11 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
     """
     Garante que a aba de destino tenha pelo menos min_rows linhas e min_cols colunas.
     Se necessário, atualiza gridProperties.rowCount / columnCount via batchUpdate.
+    Retorna o rowCount final da aba (usado para limpar o resíduo).
     """
-    meta = execute_with_retry(
-        svc.spreadsheets().get(spreadsheetId=spreadsheet_id),
-        "ler metadados (grid size)",
-    )
-    target_sheet = None
-    for s in meta.get("sheets", []):
-        props = s.get("properties", {})
-        if props.get("title") == sheet_name:
-            target_sheet = props
-            break
-
+    target_sheet = get_sheet_props(svc, spreadsheet_id, sheet_name)
     if not target_sheet:
-        # já deveria existir, mas por segurança
-        return
+        raise RuntimeError(f"aba '{sheet_name}' não encontrada")
 
     sheet_id = target_sheet["sheetId"]
     grid = target_sheet.get("gridProperties", {})
@@ -153,7 +154,7 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
         fields_list.append("gridProperties.columnCount")
 
     if not new_grid:
-        return
+        return current_rows
 
     fields_str = ",".join(fields_list)
     body = {
@@ -173,6 +174,7 @@ def ensure_dest_grid_size(svc, spreadsheet_id, sheet_name, min_rows, min_cols):
         svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body),
         "ajustar tamanho da grade",
     )
+    return max(current_rows, min_rows)
 
 
 def col_index_to_letter(n):
@@ -274,21 +276,27 @@ def read_source_block(svc, spreadsheet_id, sheet_name):
     return tratar_colunas_numericas(rows)
 
 
-# ===============================================================
-# LIMPAR DESTINO (A2:K)
-# ===============================================================
-def get_sheet_row_count(svc, spreadsheet_id, sheet_name):
-    meta = execute_with_retry(
-        svc.spreadsheets().get(spreadsheetId=spreadsheet_id),
-        "ler row count",
-    )
-    for s in meta.get("sheets", []):
-        props = s.get("properties", {})
-        if props.get("title") == sheet_name:
-            return props.get("gridProperties", {}).get("rowCount", 0)
-    return 0
+def mascara_ponto(val_b):
+    """Coluna K: 'B-' + coluna B ('B-0' quando o projeto antes do '_' tem 6 dígitos)."""
+    if val_b in ("", None):
+        return ""
+    val_b = str(val_b)
+    digits_only = re.sub(r"\D", "", val_b.split("_", 1)[0])
+    prefix = "B-0" if len(digits_only) == 6 else "B-"
+    return prefix + val_b
 
 
+_T0 = time.monotonic()
+
+
+def log_tempo(etapa):
+    """Marca no log o tempo decorrido desde o início do script."""
+    print(f"⏲️  [{time.monotonic() - _T0:6.1f}s] {etapa}")
+
+
+# ===============================================================
+# LIMPAR DESTINO
+# ===============================================================
 def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row, end_row=None, col_end="K"):
     # limpa de A{start_row} até col_end. Com end_row, delimita (evita estourar a grade).
     end = end_row if end_row is not None else ""
@@ -362,13 +370,14 @@ def copiar_unidade(svc, nome, spreadsheet_id, criterios, header, all_rows, carim
         return 0
 
     data = [header] + rows
-    ensure_dest_grid_size(svc, spreadsheet_id, UNIDADE_SHEET_NAME, len(data), NUM_COLS)
+    row_count = ensure_dest_grid_size(
+        svc, spreadsheet_id, UNIDADE_SHEET_NAME, len(data), NUM_COLS
+    )
     write_values_in_chunks(
         svc, spreadsheet_id, UNIDADE_SHEET_NAME, 1, data, WRITE_CHUNK_ROWS, NUM_COLS
     )
 
     first_residual = len(data) + 1
-    row_count = get_sheet_row_count(svc, spreadsheet_id, UNIDADE_SHEET_NAME)
     if row_count >= first_residual:
         clear_dest_range(
             svc, spreadsheet_id, UNIDADE_SHEET_NAME, first_residual, row_count, col_end="J"
@@ -445,7 +454,15 @@ def distribuir_unidades(svc, all_rows, carimbo_base):
         except Exception as e:
             falhas.append(nome)
             print(f"❌ {nome} ({sid}): {e}")
+        log_tempo(f"Unidade {nome}")
     return falhas
+
+
+def falhar(msg):
+    """Encerra com exit 1: o run do Actions fica vermelho em vez de verde."""
+    print(msg)
+    log_tempo("fim (com erro)")
+    sys.exit(1)
 
 
 def main():
@@ -454,9 +471,7 @@ def main():
     try:
         svc, sa_email = get_service_and_email()
     except FileNotFoundError as e:
-        print("❌", e)
-        print("   Coloque 'credenciais.json' na mesma pasta do script.")
-        return
+        falhar(f"❌ {e}\n   Coloque 'credenciais.json' na mesma pasta do script.")
 
     print(f"👤 Service Account: {sa_email}")
     print("   ➜ Garanta acesso às fontes listadas na BD_Config e ao destino.\n")
@@ -465,14 +480,12 @@ def main():
     try:
         ensure_dest_sheet_exists(svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME)
     except HttpError as e:
-        print("❌ Erro ao acessar destino:", e)
-        return
+        falhar(f"❌ Erro ao acessar destino: {e}")
 
     # Lê fontes da BD_Config
     source_ids = get_source_ids_from_config(svc)
     if not source_ids:
-        print("❌ Nenhuma fonte encontrada em BD_Config!A3:A (IDs/URLs).")
-        return
+        falhar("❌ Nenhuma fonte encontrada em BD_Config!A3:A (IDs/URLs).")
 
     print(f"📚 Fontes encontradas em BD_Config: {len(source_ids)}")
     for i, sid in enumerate(source_ids, start=1):
@@ -495,42 +508,52 @@ def main():
         except Exception as e:
             fontes_com_erro += 1
             report_lines.append(f"Fonte #{i}: ERRO -> {e}")
+    log_tempo("leitura das fontes")
 
     total_expected = len(all_rows)
     report_lines.append(f"\nTotal esperado: {total_expected} linha(s).")
 
+    # BASE incompleta não sobrescreve a anterior: o carteira_ponto_a_ponto e
+    # as Unidades leem dela. Melhor ficar com a BASE da última execução boa.
+    if fontes_com_erro:
+        print("\n".join(report_lines))
+        falhar(f"\n❌ {fontes_com_erro} fonte(s) com erro — BASE NÃO atualizada.")
     if total_expected == 0:
         print("\n".join(report_lines))
-        print("\nNada para colar.")
-        return
+        falhar("\n❌ Fontes sem nenhuma linha — BASE NÃO atualizada.")
 
-    # Garante que a grade da aba tenha linhas/colunas suficientes (A:J)
+    # A:J da fonte + K (máscara+ponto) calculada aqui mesmo, numa gravação só
+    base_rows = [r + [mascara_ponto(r[1])] for r in all_rows]
+    base_cols = NUM_COLS + 1  # A:K
+
+    # Garante que a grade da aba tenha linhas/colunas suficientes (A:K)
     min_rows = START_ROW_DEST + total_expected - 1
-    ensure_dest_grid_size(
+    row_count = ensure_dest_grid_size(
         svc,
         DEST_SPREADSHEET_ID,
         DEST_SHEET_NAME,
         min_rows,
-        NUM_COLS,
+        base_cols,
     )
 
     # Grava ANTES de limpar: o destino nunca fica vazio.
     # Se a gravação cair no meio, sobra mistura de dado novo + antigo
     # (sem buraco em branco). Só depois removemos o resíduo abaixo.
-    print(f"📤 Colando {total_expected} linha(s) em {DEST_SHEET_NAME}...")
+    print(f"📤 Colando {total_expected} linha(s) em {DEST_SHEET_NAME} (A:K)...")
     write_values_in_chunks(
         svc,
         DEST_SPREADSHEET_ID,
         DEST_SHEET_NAME,
         START_ROW_DEST,
-        all_rows,
+        base_rows,
         WRITE_CHUNK_ROWS,
-        NUM_COLS,
+        base_cols,
     )
+    del base_rows
+    log_tempo("colagem da BASE")
 
     # Limpa só as linhas antigas que sobraram abaixo do novo dado.
     first_residual = START_ROW_DEST + total_expected
-    row_count = get_sheet_row_count(svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME)
     if row_count >= first_residual:
         print(
             f"🧹 Limpando resíduo (linhas {first_residual}–{row_count}, A:K)..."
@@ -549,6 +572,7 @@ def main():
     pasted_count = count_pasted_rows(
         svc, DEST_SPREADSHEET_ID, DEST_SHEET_NAME, START_ROW_DEST, total_expected
     )
+    log_tempo("conferência da BASE")
 
     report_lines.append(
         f"Total efetivamente colado (A/B): {pasted_count} linha(s)."
@@ -558,66 +582,6 @@ def main():
     print("\n=== RELATÓRIO DE IMPORTAÇÃO ===")
     print("\n".join(report_lines))
     print("\n✅ OK - Tudo conferido!" if ok else "\n⚠️ Diferença detectada.")
-
-    # ===============================================================
-    # === COLUNA K: GERAR CÓDIGO A PARTIR DA COLUNA B ===============
-    # ===============================================================
-    try:
-        if pasted_count > 0:
-            start_row = START_ROW_DEST
-            end_row = START_ROW_DEST + pasted_count - 1
-
-            # garante até a coluna K
-            ensure_dest_grid_size(
-                svc,
-                DEST_SPREADSHEET_ID,
-                DEST_SHEET_NAME,
-                min_rows=end_row,
-                min_cols=11,
-            )
-
-            rng_b = f"{DEST_SHEET_NAME}!B{start_row}:B{end_row}"
-            vals_b = read_values(svc, DEST_SPREADSHEET_ID, rng_b)
-
-            new_k_values = []
-            for i in range(pasted_count):
-                val_b = ""
-                if i < len(vals_b) and vals_b[i]:
-                    val_b = vals_b[i][0]
-
-                if val_b in ("", None):
-                    new_k_values.append([""])
-                    continue
-
-                if not isinstance(val_b, str):
-                    val_b = str(val_b)
-
-                before_underscore = val_b.split("_", 1)[0]
-                digits_only = re.sub(r"\D", "", before_underscore)
-
-                if len(digits_only) == 6:
-                    prefix = "B-0"
-                elif len(digits_only) == 7:
-                    prefix = "B-"
-                else:
-                    prefix = "B-"  # fallback
-
-                k_val = prefix + val_b
-                new_k_values.append([k_val])
-
-            rng_k = f"{DEST_SHEET_NAME}!K{start_row}:K{end_row}"
-            execute_with_retry(
-                svc.spreadsheets().values().update(
-                    spreadsheetId=DEST_SPREADSHEET_ID,
-                    range=rng_k,
-                    valueInputOption="USER_ENTERED",
-                    body={"values": new_k_values},
-                ),
-                "gravar coluna K",
-            )
-            print(f"🔤 Coluna K preenchida para {pasted_count} linha(s).")
-    except Exception as e:
-        print("⚠️ Erro ao atualizar coluna K:", e)
 
     # ===============================================================
     # === TIMESTAMP EM L2 DA ABA ATIVIDADES_POR_PONTO_BASE ==========
@@ -637,25 +601,21 @@ def main():
         )
         print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!L2 (BRT): {timestamp}")
     except Exception as e:
-        print("⚠️ Erro ao gravar timestamp em L2:", e)
+        falhar(f"❌ Erro ao gravar timestamp em L2: {e}")
 
     # ===============================================================
     # === DISTRIBUIÇÃO DO ORÇAMENTO POR UNIDADE =====================
     # ===============================================================
-    # Só distribui uma BASE íntegra: fonte faltando ou colagem divergente
-    # propagaria orçamento incompleto para as Unidades.
-    if fontes_com_erro or not ok:
-        print(
-            f"\n❌ Distribuição por Unidade NÃO executada "
-            f"(fontes com erro: {fontes_com_erro}, conferência OK: {ok})."
-        )
-        sys.exit(1)
+    # Só distribui uma BASE íntegra: colagem divergente propagaria
+    # orçamento incompleto para as Unidades.
+    if not ok:
+        falhar("\n❌ Distribuição por Unidade NÃO executada (conferência da BASE divergente).")
 
     falhas = distribuir_unidades(svc, all_rows, timestamp)
     if falhas:
-        print(f"\n❌ Unidades com falha: {', '.join(falhas)}")
-        sys.exit(1)
+        falhar(f"\n❌ Unidades com falha: {', '.join(falhas)}")
     print("\n✅ Distribuição por Unidade concluída.")
+    log_tempo("fim")
 
 
 if __name__ == "__main__":

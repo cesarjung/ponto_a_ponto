@@ -5,9 +5,13 @@
 # - Concatena e cola em ATIVIDADES_POR_PONTO_BASE!A2
 # - Converte colunas A e G para número
 # - Relatório de linhas por fonte e total colado
+# - Distribui o orçamento de cada Unidade (coluna J) para a aba
+#   BD_Orçamento da planilha da Unidade + carimbo em Prog_TPM!E1/G1
+#   (substitui os Apps Scripts copiarAtividadesParaOrcamentoFiltrado)
 # ===============================================================
 
 import os
+import sys
 import re
 import time
 import random
@@ -39,6 +43,15 @@ WRITE_CHUNK_ROWS     = 20000
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_RETRIES = 6
 BASE_DELAY = 2.0  # segundos; cresce exponencial
+
+# Distribuição por Unidade: filtra a coluna J da BASE e cola A:J (com
+# cabeçalho) em BD_Orçamento!A1 da planilha da Unidade.
+UNIDADE_SHEET_NAME = "BD_Orçamento"
+PROG_TPM_SHEET     = "Prog_TPM"   # E1 = momento da cópia, G1 = carimbo da BASE (L2)
+# Gabarito das Unidades: B = nome, C = ID da planilha, E = valores da
+# coluna J aceitos (mais de um separado por vírgula). Linha 3 em diante.
+GABARITO_SPREADSHEET_ID = "1kMJedysNlxxPU2PtCwICHlBbZVL4YpvyHSsR7Xl71Ig"
+GABARITO_RANGE          = "BD_Planilhas!B3:E"
 
 # ===============================================================
 
@@ -276,10 +289,10 @@ def get_sheet_row_count(svc, spreadsheet_id, sheet_name):
     return 0
 
 
-def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row, end_row=None):
-    # limpa de A{start_row} até K. Com end_row, delimita (evita estourar a grade).
+def clear_dest_range(svc, spreadsheet_id, sheet_name, start_row, end_row=None, col_end="K"):
+    # limpa de A{start_row} até col_end. Com end_row, delimita (evita estourar a grade).
     end = end_row if end_row is not None else ""
-    rng = f"{sheet_name}!A{start_row}:K{end}"
+    rng = f"{sheet_name}!A{start_row}:{col_end}{end}"
     execute_with_retry(
         svc.spreadsheets().values().clear(
             spreadsheetId=spreadsheet_id,
@@ -337,6 +350,104 @@ def count_pasted_rows(svc, spreadsheet_id, sheet_name, start_row, expected_rows)
     )
 
 
+def copiar_unidade(svc, nome, spreadsheet_id, criterios, header, all_rows, carimbo_base):
+    """Cola em BD_Orçamento!A1 o cabeçalho + linhas da BASE cuja coluna J
+    está em `criterios`. Grava antes de limpar (destino nunca fica vazio),
+    depois limpa o resíduo A:J abaixo. Colunas K+ do destino não são tocadas.
+    Retorna o nº de linhas coladas (sem cabeçalho); 0 = nada feito.
+    """
+    rows = [r for r in all_rows if str(r[9]).strip().upper() in criterios]
+    if not rows:
+        print(f"⚠️  {nome}: nenhuma linha na BASE para {sorted(criterios)}. Destino mantido.")
+        return 0
+
+    data = [header] + rows
+    ensure_dest_grid_size(svc, spreadsheet_id, UNIDADE_SHEET_NAME, len(data), NUM_COLS)
+    write_values_in_chunks(
+        svc, spreadsheet_id, UNIDADE_SHEET_NAME, 1, data, WRITE_CHUNK_ROWS, NUM_COLS
+    )
+
+    first_residual = len(data) + 1
+    row_count = get_sheet_row_count(svc, spreadsheet_id, UNIDADE_SHEET_NAME)
+    if row_count >= first_residual:
+        clear_dest_range(
+            svc, spreadsheet_id, UNIDADE_SHEET_NAME, first_residual, row_count, col_end="J"
+        )
+
+    pasted = count_pasted_rows(svc, spreadsheet_id, UNIDADE_SHEET_NAME, 1, len(data))
+    if pasted != len(data):
+        raise RuntimeError(f"conferência: esperado {len(data)} linha(s), colado {pasted}")
+
+    now_brt = datetime.now(timezone.utc) - timedelta(hours=3)
+    execute_with_retry(
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {"range": f"{PROG_TPM_SHEET}!E1",
+                     "values": [[now_brt.strftime("%d/%m/%Y %H:%M:%S")]]},
+                    {"range": f"{PROG_TPM_SHEET}!G1", "values": [[carimbo_base]]},
+                ],
+            },
+        ),
+        f"{nome}: carimbo Prog_TPM",
+    )
+    return len(rows)
+
+
+def get_destinos_unidade(svc):
+    """Lê o gabarito BD_Planilhas e devolve [(nome, id, {valores J})]."""
+    destinos = []
+    for row in read_values(svc, GABARITO_SPREADSHEET_ID, GABARITO_RANGE):
+        row = pad_row_to_n_cols(row, 4)
+        nome = row[0].strip()
+        sid = extract_spreadsheet_id(row[1])
+        criterios = {v.strip().upper() for v in row[3].split(",") if v.strip()}
+        if not (sid or criterios):
+            continue  # linha vazia
+        if not sid or not criterios:
+            print(f"⚠️  Gabarito: linha '{nome}' sem ID ou sem valores em E — ignorada.")
+            continue
+        destinos.append((nome or sid, sid, criterios))
+    return destinos
+
+
+def distribuir_unidades(svc, all_rows, carimbo_base):
+    """Copia o orçamento de cada Unidade. Uma Unidade com erro não impede
+    as outras. Retorna a lista de Unidades que falharam."""
+    print("\n=== DISTRIBUIÇÃO POR UNIDADE ===")
+    header = read_values(svc, DEST_SPREADSHEET_ID, f"{DEST_SHEET_NAME}!A1:J1")
+    header = pad_row_to_n_cols(header[0] if header else [], NUM_COLS)
+
+    # Linha sem Unidade não vai para planilha nenhuma. Costuma ser o
+    # ARRAYFORMULA da coluna I/J da fonte quebrado (#REF!) por dado colado.
+    sem_unidade = sum(1 for r in all_rows if not str(r[9]).strip())
+    if sem_unidade:
+        print(f"⚠️  {sem_unidade} linha(s) da BASE sem Unidade (coluna J vazia) — ficam fora.")
+
+    try:
+        destinos = get_destinos_unidade(svc)
+    except Exception as e:
+        print(f"❌ Erro ao ler o gabarito {GABARITO_RANGE}: {e}")
+        return ["gabarito"]
+    if not destinos:
+        print(f"❌ Nenhuma Unidade válida em {GABARITO_RANGE}.")
+        return ["gabarito"]
+    print(f"📋 Gabarito: {len(destinos)} Unidade(s).")
+
+    falhas = []
+    for nome, sid, criterios in destinos:
+        try:
+            n = copiar_unidade(svc, nome, sid, criterios, header, all_rows, carimbo_base)
+            if n:
+                print(f"✅ {nome}: {n} linha(s) em {UNIDADE_SHEET_NAME}.")
+        except Exception as e:
+            falhas.append(nome)
+            print(f"❌ {nome} ({sid}): {e}")
+    return falhas
+
+
 def main():
     print("🔄 Iniciando importação baseado em BD_Config!A3:A ...\n")
 
@@ -371,15 +482,18 @@ def main():
     # Lê todas as fontes e empilha
     all_rows = []
     report_lines = []
+    fontes_com_erro = 0
     for i, fid in enumerate(source_ids, start=1):
         try:
             rows = read_source_block(svc, fid, SOURCE_SHEET_NAME)
             report_lines.append(f"Fonte #{i}: {len(rows)} linha(s).")
             all_rows.extend(rows)
         except HttpError as e:
+            fontes_com_erro += 1
             report_lines.append(f"Fonte #{i}: ERRO -> {e}")
             print(f"⚠️  Origem #{i} inacessível (ID: {fid}). Compartilhe com {sa_email}.")
         except Exception as e:
+            fontes_com_erro += 1
             report_lines.append(f"Fonte #{i}: ERRO -> {e}")
 
     total_expected = len(all_rows)
@@ -524,6 +638,24 @@ def main():
         print(f"⏱️ Timestamp gravado em {DEST_SHEET_NAME}!L2 (BRT): {timestamp}")
     except Exception as e:
         print("⚠️ Erro ao gravar timestamp em L2:", e)
+
+    # ===============================================================
+    # === DISTRIBUIÇÃO DO ORÇAMENTO POR UNIDADE =====================
+    # ===============================================================
+    # Só distribui uma BASE íntegra: fonte faltando ou colagem divergente
+    # propagaria orçamento incompleto para as Unidades.
+    if fontes_com_erro or not ok:
+        print(
+            f"\n❌ Distribuição por Unidade NÃO executada "
+            f"(fontes com erro: {fontes_com_erro}, conferência OK: {ok})."
+        )
+        sys.exit(1)
+
+    falhas = distribuir_unidades(svc, all_rows, timestamp)
+    if falhas:
+        print(f"\n❌ Unidades com falha: {', '.join(falhas)}")
+        sys.exit(1)
+    print("\n✅ Distribuição por Unidade concluída.")
 
 
 if __name__ == "__main__":

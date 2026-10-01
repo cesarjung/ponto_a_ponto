@@ -13,6 +13,8 @@
 import os
 import sys
 import re
+import json
+import hashlib
 import time
 import random
 import socket
@@ -48,6 +50,12 @@ BASE_DELAY = 2.0  # segundos; cresce exponencial
 # cabeçalho) em BD_Orçamento!A1 da planilha da Unidade.
 UNIDADE_SHEET_NAME = "BD_Orçamento"
 PROG_TPM_SHEET     = "Prog_TPM"   # E1 = momento da cópia, G1 = carimbo da BASE (L2)
+# Impressão digital do último bloco gravado em cada Unidade, guardada em
+# developer metadata da planilha (invisível; não ocupa célula). Se o bloco
+# novo tiver o mesmo hash e o destino o mesmo nº de linhas, a gravação é
+# pulada. A primeira execução de cada dia (BRT) regrava tudo mesmo assim,
+# para desfazer edição manual direta na BD_Orçamento.
+HASH_METADATA_KEY  = "ponto_a_ponto_bd_orcamento"
 # Gabarito das Unidades: B = nome, C = ID da planilha, E = valores da
 # coluna J aceitos (mais de um separado por vírgula). Linha 3 em diante.
 GABARITO_SPREADSHEET_ID = "1kMJedysNlxxPU2PtCwICHlBbZVL4YpvyHSsR7Xl71Ig"
@@ -358,18 +366,96 @@ def count_pasted_rows(svc, spreadsheet_id, sheet_name, start_row, expected_rows)
     )
 
 
+def hash_bloco(data):
+    """SHA-256 do bloco (cabeçalho + linhas) exatamente como seria gravado."""
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def ler_estado_unidade(svc, spreadsheet_id):
+    """Devolve (metadataId, {"hash", "dia"}) do último bloco gravado, ou (None, {})."""
+    resp = execute_with_retry(
+        svc.spreadsheets().developerMetadata().search(
+            spreadsheetId=spreadsheet_id,
+            body={"dataFilters": [
+                {"developerMetadataLookup": {"metadataKey": HASH_METADATA_KEY}}
+            ]},
+        ),
+        "ler hash da Unidade",
+    )
+    for m in resp.get("matchedDeveloperMetadata", []):
+        md = m.get("developerMetadata", {})
+        try:
+            return md.get("metadataId"), json.loads(md.get("metadataValue") or "{}")
+        except ValueError:
+            return md.get("metadataId"), {}
+    return None, {}
+
+
+def req_gravar_estado(metadata_id, estado):
+    """Request de batchUpdate que cria/atualiza o developer metadata do hash."""
+    valor = json.dumps(estado)
+    if metadata_id is None:
+        return {"createDeveloperMetadata": {"developerMetadata": {
+            "metadataKey": HASH_METADATA_KEY,
+            "metadataValue": valor,
+            "location": {"spreadsheet": True},
+            "visibility": "DOCUMENT",
+        }}}
+    return {"updateDeveloperMetadata": {
+        "dataFilters": [{"developerMetadataLookup": {"metadataId": metadata_id}}],
+        "developerMetadata": {"metadataValue": valor},
+        "fields": "metadataValue",
+    }}
+
+
+def linhas_no_destino(svc, spreadsheet_id):
+    """Nº da última linha com conteúdo em A:B da BD_Orçamento (inclui cabeçalho)."""
+    return len(read_values(svc, spreadsheet_id, f"{UNIDADE_SHEET_NAME}!A:B"))
+
+
 def copiar_unidade(svc, nome, spreadsheet_id, criterios, header, all_rows, carimbo_base):
     """Cola em BD_Orçamento!A1 o cabeçalho + linhas da BASE cuja coluna J
     está em `criterios`. Grava antes de limpar (destino nunca fica vazio),
     depois limpa o resíduo A:J abaixo. Colunas K+ do destino não são tocadas.
-    Retorna o nº de linhas coladas (sem cabeçalho); 0 = nada feito.
+    Pula a gravação quando o bloco é idêntico ao último gravado (ver
+    HASH_METADATA_KEY). Retorna (nº de linhas sem cabeçalho, gravou?).
     """
     rows = [r for r in all_rows if str(r[9]).strip().upper() in criterios]
     if not rows:
         print(f"⚠️  {nome}: nenhuma linha na BASE para {sorted(criterios)}. Destino mantido.")
-        return 0
+        return 0, False
 
     data = [header] + rows
+    novo_hash = hash_bloco(data)
+    hoje = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%d")
+    metadata_id, estado = ler_estado_unidade(svc, spreadsheet_id)
+
+    motivo = None
+    if estado.get("hash") != novo_hash:
+        motivo = "conteúdo mudou" if estado.get("hash") else "sem hash anterior"
+    elif estado.get("dia") != hoje:
+        motivo = "regravação diária"
+    else:
+        n_dest = linhas_no_destino(svc, spreadsheet_id)
+        if n_dest != len(data):
+            motivo = f"destino com {n_dest} linha(s), esperado {len(data)}"
+
+    if motivo is None:
+        # Destino já tem exatamente este bloco: só atualiza o carimbo da BASE.
+        execute_with_retry(
+            svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{PROG_TPM_SHEET}!G1",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[carimbo_base]]},
+            ),
+            f"{nome}: carimbo G1",
+        )
+        print(f"⏭️  {nome}: sem mudança ({len(rows)} linha(s)) — gravação pulada.")
+        return len(rows), False
+
+    print(f"📤 {nome}: gravando ({motivo})...")
     row_count = ensure_dest_grid_size(
         svc, spreadsheet_id, UNIDADE_SHEET_NAME, len(data), NUM_COLS
     )
@@ -402,7 +488,17 @@ def copiar_unidade(svc, nome, spreadsheet_id, criterios, header, all_rows, carim
         ),
         f"{nome}: carimbo Prog_TPM",
     )
-    return len(rows)
+    # Hash só depois da conferência: se algo falhar antes, o próximo run regrava.
+    execute_with_retry(
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [
+                req_gravar_estado(metadata_id, {"hash": novo_hash, "dia": hoje})
+            ]},
+        ),
+        f"{nome}: gravar hash",
+    )
+    return len(rows), True
 
 
 def get_destinos_unidade(svc):
@@ -448,8 +544,10 @@ def distribuir_unidades(svc, all_rows, carimbo_base):
     falhas = []
     for nome, sid, criterios in destinos:
         try:
-            n = copiar_unidade(svc, nome, sid, criterios, header, all_rows, carimbo_base)
-            if n:
+            n, gravou = copiar_unidade(
+                svc, nome, sid, criterios, header, all_rows, carimbo_base
+            )
+            if gravou:
                 print(f"✅ {nome}: {n} linha(s) em {UNIDADE_SHEET_NAME}.")
         except Exception as e:
             falhas.append(nome)

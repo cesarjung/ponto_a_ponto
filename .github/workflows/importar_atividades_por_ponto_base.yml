@@ -3,11 +3,9 @@ name: Orçamento Atividades
 on:
   schedule:
     # Horário do GitHub Actions é UTC
-    # 07:00 BRT -> 10:00 UTC
-    # 12:00 BRT -> 15:00 UTC
-    # 15:00 BRT -> 18:00 UTC
-    # 18:00 BRT -> 21:00 UTC
-    - cron: "0 10,15,18,21 * * *"
+    # A cada 2 horas, nas horas pares de BRT (00h, 02h, ..., 22h BRT)
+    # -> horas ímpares em UTC (BRT = UTC-3)
+    - cron: "0 1-23/2 * * *"
   workflow_dispatch:
 
 # Evita duas execuções gravando no mesmo destino ao mesmo tempo

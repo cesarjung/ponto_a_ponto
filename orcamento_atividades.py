@@ -594,10 +594,16 @@ def main():
     all_rows = []
     report_lines = []
     fontes_com_erro = 0
+    sem_chave = []
     for i, fid in enumerate(source_ids, start=1):
         try:
             rows = read_source_block(svc, fid, SOURCE_SHEET_NAME)
             report_lines.append(f"Fonte #{i}: {len(rows)} linha(s).")
+            # Linha com dado só em C:J (A e B vazias) é colada, mas não entra
+            # na conferência por A/B. Aponta onde está para corrigirem na fonte.
+            for j, r in enumerate(rows):
+                if not any(c not in ("", None) for c in r[:2]):
+                    sem_chave.append((i, j + 2, r))
             all_rows.extend(rows)
         except HttpError as e:
             fontes_com_erro += 1
@@ -610,6 +616,10 @@ def main():
 
     total_expected = len(all_rows)
     report_lines.append(f"\nTotal esperado: {total_expected} linha(s).")
+    if sem_chave:
+        print(f"⚠️  {len(sem_chave)} linha(s) com A e B vazias nas fontes (fora da conferência):")
+        for i, linha, r in sem_chave[:20]:
+            print(f"   - Fonte #{i}, {SOURCE_SHEET_NAME}!{linha}: {r}")
 
     # BASE incompleta não sobrescreve a anterior: o carteira_ponto_a_ponto e
     # as Unidades leem dela. Melhor ficar com a BASE da última execução boa.
@@ -675,7 +685,7 @@ def main():
     report_lines.append(
         f"Total efetivamente colado (A/B): {pasted_count} linha(s)."
     )
-    ok = pasted_count == total_expected
+    ok = pasted_count == total_expected - len(sem_chave)
 
     print("\n=== RELATÓRIO DE IMPORTAÇÃO ===")
     print("\n".join(report_lines))
